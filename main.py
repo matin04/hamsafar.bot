@@ -322,3 +322,140 @@ async def decline_passenger(callback: CallbackQuery):
     pending_requests.pop(passenger_id, None)
 
 
+class ManageRequestStates(StatesGroup):
+    waiting_for_driver = State()
+
+@dp.callback_query(F.data.startswith("send_"))
+async def send_request(callback: CallbackQuery, state: FSMContext):
+    driver_id = int(callback.data.split("_")[1])
+    passenger_id = callback.from_user.id
+
+    async with async_session() as session:
+        driver = await session.get(Driver, driver_id)
+        passenger = await session.scalar(select(User).filter_by(tg_id=passenger_id))
+        if not driver or driver.seats <= 0:
+            await callback.message.answer("Ин маршрут дастнорас аст.")
+            return
+
+        driver_user = await session.get(User, driver.user_id)
+
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Қабул", callback_data=f"confirm_accept_{passenger_id}_{driver_id}"),
+                InlineKeyboardButton(text="Рад", callback_data=f"confirm_decline_{passenger_id}_{driver_id}")
+            ]
+        ])
+
+        await bot.send_message(
+            chat_id=driver_user.tg_id,
+            text=f"@{passenger.username} мехоҳад ба маршрути шумо ({driver.trip}) ҳамроҳ шавад.",
+            reply_markup=kb
+        )
+
+        await callback.message.answer("Дархост ба ронанда фиристода шуд.")
+        await state.set_state(ManageRequestStates.waiting_for_driver)
+
+@dp.callback_query(F.data.startswith("confirm_accept_"))
+async def confirm_accept(callback: CallbackQuery):
+    _, _, passenger_id_str, driver_id_str = callback.data.split("_")
+    passenger_id = int(passenger_id_str)
+    driver_id = int(driver_id_str)
+
+    async with async_session() as session:
+        driver = await session.get(Driver, driver_id)
+        if not driver:
+            await callback.message.answer("Маршрут дигар нест.")
+            return
+
+        driver.seats -= 1
+        if driver.seats <= 0:
+            await session.delete(driver)
+        await session.commit()
+
+    await bot.send_message(passenger_id, "Ронанда дархости шуморо қабул кард.")
+    await callback.message.answer("Шумо дархостро қабул кардед.")
+
+@dp.callback_query(F.data.startswith("confirm_decline_"))
+async def confirm_decline(callback: CallbackQuery):
+    _, _, passenger_id_str, driver_id_str = callback.data.split("_")
+    passenger_id = int(passenger_id_str)
+
+    await bot.send_message(passenger_id, "Ронанда дархости шуморо рад кард.")
+    await callback.message.answer("Шумо дархостро рад кардед.")
+
+
+
+
+@dp.message(F.text == "/Все маршруты с дополнительной информацией")
+async def all_routes(message: Message):
+    async with async_session() as session:
+        result = await session.execute(select(Driver))
+        routes = result.scalars().all()
+
+        if not routes:
+            await message.answer("Ҳеҷ як маршрут ёфт нашуд.")
+            return
+
+        for route in routes:
+            user = await session.get(User, route.user_id)
+
+            text = (
+                f"<b>Маршрут</b>\n"
+                f"Ронанда: @{user.username}\n"
+                f"Телефон: {user.phone}\n"
+                f"Масир: {route.trip}\n"
+                f"Ҷойҳои холӣ: {route.seats}\n"
+            )
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Отправить заявку", callback_data=f"request_{route.id}")]
+            ])
+
+            await message.answer(text, reply_markup=kb,)
+
+
+
+@dp.message(F.text == "Все маршруты с дополнительной информацией")
+async def show_all_routes_button(message: Message):
+    await all_routes(message)  
+
+
+
+@dp.message(F.text == "Маршрутҳои пуршуда")
+async def show_full_routes(message: Message):
+    async with async_session() as session:
+        result = await session.execute(select(Driver).where(Driver.seats == 0))
+        full_routes = result.scalars().all()
+
+    if not full_routes:
+        await message.answer("Ҳоло маршрутҳои пуршуда вуҷуд надоранд.")
+        return
+
+    for route in full_routes:
+        user = await session.get(User, route.user_id)
+
+
+
+        text = (
+            f"<--> Маршрути пуршуда <-->\n"
+            f"Ронанда: @{user.username}\n"
+            f"Телефон: {user.phone}\n"
+            f"Масир: {route.trip}\n"
+            f"Ҷойҳои холӣ: {route.seats}\n"
+        )
+
+        await message.answer(text,)
+
+
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+async def main():
+    await init_db()
+    await dp.start_polling(bot)
+
+if __name__ == '__main__':
+    asyncio.run(main())
