@@ -162,3 +162,163 @@ async def request_to_driver(callback: CallbackQuery):
         await session.commit()
 
     await callback.message.answer("Вы записаны на маршрут!")
+
+
+from aiogram.fsm.state import State, StatesGroup
+
+class SearchStates(StatesGroup):
+    waiting_for_query = State()
+
+@dp.message(F.text.lower() == "ҷустуҷӯи маршрут")
+async def start_search(message: Message, state: FSMContext):
+    await message.answer("Лутфан номи шаҳрро нависед (масалан: Душанбе):")
+    await state.set_state(SearchStates.waiting_for_query)
+
+@dp.message(SearchStates.waiting_for_query)
+async def perform_search(message: Message, state: FSMContext):
+    query = message.text.strip().lower()
+
+    async with async_session() as session:
+        result = await session.execute(select(Driver))
+        drivers = result.scalars().all()
+
+    matched = [d for d in drivers if query in d.trip.lower()]
+    
+    if not matched:
+        await message.answer("Маршруте бо ин шаҳр ёфт нашуд.")
+    else:
+        for driver in matched:
+            async with async_session() as session:
+                user = await session.get(User, driver.user_id)
+
+            text = (
+                f"<-->Маршрут<--> \n"
+                f"Ронанда: @{user.username}\n"
+                f"Масир: {driver.trip}\n"
+                f"Телефон: {user.phone}\n"
+                f"Ҷойҳо: {driver.seats}"
+            )
+            await message.answer(text)
+
+    await state.clear()
+
+
+
+class ExtendedStates(StatesGroup):
+    from_location = State()
+    to_location = State()
+    phone = State()
+    seats = State()
+
+@dp.message(F.text.lower() == 'добавить расширенный маршрут')
+async def add_extended_trip(message: Message, state: FSMContext):
+    await message.answer("Аз куҷо ҳаракат мекунед?")
+    await state.set_state(ExtendedStates.from_location)
+
+@dp.message(ExtendedStates.from_location)
+async def set_from_location(message: Message, state: FSMContext):
+    await state.update_data(from_location=message.text.strip())
+    await message.answer("То куҷо меравад?")
+    await state.set_state(ExtendedStates.to_location)
+
+@dp.message(ExtendedStates.to_location)
+async def set_to_location(message: Message, state: FSMContext):
+    await state.update_data(to_location=message.text.strip())
+    await message.answer("Рақами телефонро ворид кунед:")
+    await state.set_state(ExtendedStates.phone)
+
+@dp.message(ExtendedStates.phone)
+async def set_phone_extended(message: Message, state: FSMContext):
+    await state.update_data(phone=message.text.strip())
+    await message.answer("Чанд ҷойи холӣ ҳаст?")
+    await state.set_state(ExtendedStates.seats)
+
+@dp.message(ExtendedStates.seats)
+async def finish_extended_trip(message: Message, state: FSMContext):
+    data = await state.get_data()
+    trip = f"{data['from_location']} - {data['to_location']}"
+    seats = int(message.text.strip())
+
+    async with async_session() as session:
+        user = await session.scalar(select(User).filter_by(tg_id=message.from_user.id))
+        if user:
+            user.phone = data['phone']
+            new_driver = Driver(
+                user_id=user.id,
+                trip=trip,
+                seats=seats
+            )
+            session.add(new_driver)
+            await session.commit()
+
+    await message.answer(f"Маршрут {trip} бо {seats} ҷой илова шуд!")
+    await state.clear()
+
+
+class ConfirmRequestState(StatesGroup):
+    awaiting = State()
+
+pending_requests = {}  
+
+@dp.callback_query(F.data.startswith("request_"))
+async def handle_passenger_request(callback: CallbackQuery, state: FSMContext):
+    driver_id = int(callback.data.split("_")[1])
+    passenger_id = callback.from_user.id
+
+    async with async_session() as session:
+        driver = await session.get(Driver, driver_id)
+        if not driver or driver.seats <= 0:
+            await callback.message.answer("Ин маршрут дигар фаъол нест.")
+            return
+        user = await session.get(User, driver.user_id)
+
+        if not user:
+            await callback.message.answer("Ронанда нест.")
+            return
+
+        pending_requests[passenger_id] = driver_id
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Қабул мекунам", callback_data=f"accept_{passenger_id}"),
+                InlineKeyboardButton(text="Рад мекунам", callback_data=f"decline_{passenger_id}")
+            ]
+        ])
+
+        try:
+            await bot.send_message(
+                chat_id=user.tg_id,
+                text=f"Клиент мехоҳад ба маршрут {driver.trip} биравад. Қабул мекунед?",
+                reply_markup=kb
+            )
+        except:
+            await callback.message.answer("Бо ронанда иртибот намешавад.")
+            return
+
+        await callback.message.answer("Запрос фиристода шуд.")
+
+@dp.callback_query(F.data.startswith("accept_"))
+async def accept_passenger(callback: CallbackQuery):
+    passenger_id = int(callback.data.split("_")[1])
+    driver_id = pending_requests.get(passenger_id)
+
+    async with async_session() as session:
+        driver = await session.get(Driver, driver_id)
+        if driver:
+            driver.seats -= 1
+            if driver.seats <= 0:
+                await session.delete(driver)
+            await session.commit()
+
+    await bot.send_message(passenger_id, "Ронанда шуморо қабул кард!")
+    await callback.message.answer("Шумо пассажирро қабул кардед.")
+    pending_requests.pop(passenger_id, None)
+
+@dp.callback_query(F.data.startswith("decline_"))
+async def decline_passenger(callback: CallbackQuery):
+    passenger_id = int(callback.data.split("_")[1])
+    await bot.send_message(passenger_id, "Ронанда шуморо рад кард.")
+    await callback.message.answer("Шумо пассажирро рад кардед.")
+    pending_requests.pop(passenger_id, None)
+
+
